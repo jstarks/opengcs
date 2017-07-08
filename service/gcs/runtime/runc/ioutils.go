@@ -2,13 +2,14 @@ package runc
 
 import (
 	"fmt"
-	"github.com/Sirupsen/logrus"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"syscall"
 	"unsafe"
+
+	"github.com/Sirupsen/logrus"
 
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fifo"
@@ -30,9 +31,18 @@ type ioSet struct {
 }
 
 // GetStdioPipes returns the stdio pipes used by the given process.
-func (r *runcRuntime) GetStdioPipes(id string, pid int) (*runtime.StdioPipes, error) {
-	processDir := r.getProcessDir(id, pid)
+func (c *container) GetStdioPipes() (*runtime.StdioPipes, error) {
+	return c.r.getStdioPipes(c.id, c.pid)
+}
 
+// GetStdioPipes returns the stdio pipes used by the given process.
+func (p *process) GetStdioPipes() (*runtime.StdioPipes, error) {
+	return p.c.r.getStdioPipes(p.c.id, p.pid)
+}
+
+// getStdioPipes returns the stdio pipes used by the given process.
+func (r *runcRuntime) getStdioPipes(id string, pid int) (*runtime.StdioPipes, error) {
+	processDir := r.getProcessDir(id, pid)
 	stdinPath := filepath.Join(processDir, "in")
 	var stdin io.WriteCloser
 	stdinPathExists, err := r.pathExists(stdinPath)
