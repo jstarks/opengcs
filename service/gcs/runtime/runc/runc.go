@@ -5,13 +5,13 @@ package runc
 import (
 	"encoding/json"
 	"io/ioutil"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	containerdsys "github.com/docker/containerd/sys"
 	oci "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -47,14 +47,25 @@ func (c *container) Pid() int {
 	return c.p.Pid()
 }
 
+// GetStdioPipes returns the stdio pipes used by the given process.
+func (c *container) GetStdioPipes() *runtime.StdioPipes {
+	return c.p.GetStdioPipes()
+}
+
 type process struct {
-	r   *runcRuntime
-	id  string
-	pid int
+	r     *runcRuntime
+	id    string
+	pid   int
+	pipes *runtime.StdioPipes
 }
 
 func (p *process) Pid() int {
 	return p.pid
+}
+
+// GetStdioPipes returns the stdio pipes used by the given process.
+func (p *process) GetStdioPipes() *runtime.StdioPipes {
+	return p.pipes
 }
 
 // NewRuntime instantiates a new runcRuntime struct.
@@ -68,14 +79,8 @@ func NewRuntime() (*runcRuntime, error) {
 
 // initialize sets up any state necessary for the runcRuntime to function.
 func (r *runcRuntime) initialize() error {
-	exists, err := r.pathExists(containerFilesDir)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		if err := os.MkdirAll(containerFilesDir, 0700); err != nil {
-			return errors.Wrapf(err, "failed making runC container files directory %s", containerFilesDir)
-		}
+	if err := os.MkdirAll(containerFilesDir, 0700); err != nil {
+		return errors.Wrapf(err, "failed making runC container files directory %s", containerFilesDir)
 	}
 	return nil
 }
@@ -467,6 +472,47 @@ func (c *container) runExecCommand(processDef oci.Process, stdioOptions runtime.
 	return c.r.startProcess(c.p.id, tempProcessDir, processDef.Terminal, stdioOptions, args...)
 }
 
+func startCmdWithPipes(cmd *exec.Cmd, stdioOptions runtime.StdioOptions) (pipes *runtime.StdioPipes, err error) {
+	var stdin, stdout, stderr *os.File
+	pipes = &runtime.StdioPipes{}
+	defer func() {
+		stdin.Close()
+		stdout.Close()
+		stderr.Close()
+		if err != nil {
+			pipes.Close()
+		}
+	}()
+
+	if stdioOptions.CreateIn {
+		stdin, pipes.In, err = os.Pipe()
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to create stdin pipe")
+		}
+	}
+	if stdioOptions.CreateOut {
+		pipes.Out, err = cmd.StdoutPipe()
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to create stdout pipe")
+		}
+	}
+	if stdioOptions.CreateErr {
+		pipes.Err, err = cmd.StderrPipe()
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to create stderr pipe")
+		}
+	}
+
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	err = cmd.Start()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return pipes, nil
+}
+
 // startProcess performs the operations necessary to start a container process
 // and properly handle its stdio.
 // This function is used by both CreateContainer and ExecProcess.
@@ -482,41 +528,43 @@ func (r *runcRuntime) startProcess(id string, tempProcessDir string, hasTerminal
 
 	args = append(args, "--pid-file", filepath.Join(tempProcessDir, "pid"))
 
-	var cmdStdin *os.File
-	var cmdStdout *os.File
-	var cmdStderr *os.File
+	var sockListener *net.UnixListener
 	if hasTerminal {
-		sockListener, consoleSockPath, err := r.createConsoleSocket(tempProcessDir)
+		var consoleSockPath string
+		sockListener, consoleSockPath, err = r.createConsoleSocket(tempProcessDir)
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, "--console-socket", consoleSockPath)
-		// setupIOForTerminal blocks, so it needs to run in a separate go
-		// routine.
-		go func() {
-			if err := r.setupIOForTerminal(tempProcessDir, stdioOptions, sockListener); err != nil {
-				logrus.Error(err)
-			}
-		}()
+	}
 
-	} else {
-		ioSet, err := r.setupIOWithoutTerminal(id, tempProcessDir, stdioOptions)
+	var pipes *runtime.StdioPipes
+	defer func() {
 		if err != nil {
-			return nil, err
+			pipes.Close()
 		}
-		cmdStdin = ioSet.InR
-		cmdStdout = ioSet.OutW
-		cmdStderr = ioSet.ErrW
-	}
-	args = append(args, id)
+	}()
 
+	args = append(args, id)
 	cmd := exec.Command(runcPath, args...)
-	cmd.Stdin = cmdStdin
-	cmd.Stdout = cmdStdout
-	cmd.Stderr = cmdStderr
-	if err := cmd.Start(); err != nil {
-		return nil, errors.Wrapf(err, "failed to start runc create/exec call for container %s", id)
+
+	if hasTerminal {
+		if err := cmd.Start(); err != nil {
+			return nil, errors.Wrapf(err, "failed to start runc create/exec call for container %s", id)
+		}
+
+		pipes = &runtime.StdioPipes{}
+		pipes.Pty, err = r.getMasterFromSocket(sockListener)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to get PTY master")
+		}
+	} else {
+		pipes, err = startCmdWithPipes(cmd, stdioOptions)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to start runc create/exec call for container %s", id)
+		}
 	}
+
 	if err := cmd.Wait(); err != nil {
 		return nil, errors.Wrapf(err, "failed to wait on runc create/exec call for container %s", id)
 	}
@@ -529,5 +577,5 @@ func (r *runcRuntime) startProcess(id string, tempProcessDir string, hasTerminal
 	if err := os.Rename(tempProcessDir, filepath.Join(r.getContainerDir(id), strconv.Itoa(pid))); err != nil {
 		return nil, err
 	}
-	return &process{r: r, id: id, pid: pid}, nil
+	return &process{r: r, id: id, pid: pid, pipes: pipes}, nil
 }

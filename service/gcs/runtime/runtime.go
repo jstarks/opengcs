@@ -43,6 +43,31 @@ type StdioPipes struct {
 	In  io.WriteCloser
 	Out io.ReadCloser
 	Err io.ReadCloser
+	Pty io.ReadWriteCloser
+}
+
+// Close closes all the closers in StdioPipes
+func (pipes *StdioPipes) Close() error {
+	if pipes == nil {
+		return nil
+	}
+	if pipes.In != nil {
+		pipes.In.Close()
+		pipes.In = nil
+	}
+	if pipes.Out != nil {
+		pipes.Out.Close()
+		pipes.Out = nil
+	}
+	if pipes.Err != nil {
+		pipes.Err.Close()
+		pipes.Err = nil
+	}
+	if pipes.Pty != nil {
+		pipes.Pty.Close()
+		pipes.Pty = nil
+	}
+	return nil
 }
 
 // Process is an interface to manipulate process state.
@@ -50,7 +75,7 @@ type Process interface {
 	Wait() (oslayer.ProcessExitState, error)
 	Pid() int
 	Delete() error
-	GetStdioPipes() (*StdioPipes, error)
+	GetStdioPipes() *StdioPipes
 }
 
 // Container is an interface to manipulate container state.

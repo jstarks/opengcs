@@ -121,6 +121,6 @@ func (c *container) Wait() (oslayer.ProcessExitState, error) {
 	return state, nil
 }
 
-func (c *container) GetStdioPipes() (*runtime.StdioPipes, error) {
-	return &runtime.StdioPipes{}, nil
+func (c *container) GetStdioPipes() *runtime.StdioPipes {
+	return &runtime.StdioPipes{}
 }

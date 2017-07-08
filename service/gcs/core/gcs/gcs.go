@@ -185,9 +185,9 @@ func (c *gcsCore) ExecProcess(id string, params prot.ProcessParameters, stdioSet
 	var p runtime.Process
 
 	stdioOptions := runtime.StdioOptions{
-		CreateIn:  params.CreateStdInPipe,
-		CreateOut: params.CreateStdOutPipe,
-		CreateErr: params.CreateStdErrPipe,
+		CreateIn:  stdioSet.In != nil,
+		CreateOut: stdioSet.Out != nil,
+		CreateErr: stdioSet.Err != nil,
 	}
 	isInitProcess := len(containerEntry.Processes) == 0
 	if isInitProcess {
@@ -210,8 +210,16 @@ func (c *gcsCore) ExecProcess(id string, params prot.ProcessParameters, stdioSet
 			}
 		}
 
+		if err := container.Start(); err != nil {
+			return -1, err
+		}
+
+		waitStdio := copyStdio(stdioSet, container.GetStdioPipes())
+
 		go func() {
 			state, err := container.Wait()
+			waitStdio()
+
 			c.containerCacheMutex.Lock()
 			if err != nil {
 				logrus.Error(err)
@@ -240,10 +248,6 @@ func (c *gcsCore) ExecProcess(id string, params prot.ProcessParameters, stdioSet
 			delete(c.containerCache, id)
 			c.containerCacheMutex.Unlock()
 		}()
-
-		if err := container.Start(); err != nil {
-			return -1, err
-		}
 	} else {
 		ociProcess, err := processParametersToOCI(params)
 		if err != nil {
@@ -254,6 +258,8 @@ func (c *gcsCore) ExecProcess(id string, params prot.ProcessParameters, stdioSet
 			return -1, err
 		}
 
+		waitStdio := copyStdio(stdioSet, p.GetStdioPipes())
+
 		go func() {
 			state, err := p.Wait()
 			if err != nil {
@@ -261,16 +267,7 @@ func (c *gcsCore) ExecProcess(id string, params prot.ProcessParameters, stdioSet
 			}
 			utils.LogMsgf("container process %d exited with exit status %d", p.Pid(), state.ExitCode())
 
-			// Close stdin.
-			// TODO: Remove this conditional when stdio forwarding for non-terminal processes is fixed.
-			if ociProcess.Terminal {
-				if err := stdioSet.In.CloseRead(); err != nil {
-					logrus.Errorf("failed call to CloseRead for non-initial process stdin: %v: %s", ociProcess.Args, err)
-				}
-				if err := stdioSet.In.Close(); err != nil {
-					logrus.Errorf("failed call to Close for non-initial process stdin: %v: %s", ociProcess.Args, err)
-				}
-			}
+			waitStdio()
 
 			c.processCacheMutex.Lock()
 			processEntry.ExitStatus = state
@@ -282,11 +279,6 @@ func (c *gcsCore) ExecProcess(id string, params prot.ProcessParameters, stdioSet
 				logrus.Error(err)
 			}
 		}()
-	}
-
-	// Connect the container's stdio to the stdio pipes.
-	if err := c.setupStdioPipes(p, stdioSet); err != nil {
-		return -1, err
 	}
 
 	c.processCacheMutex.Lock()
@@ -393,33 +385,78 @@ func (c *gcsCore) ListProcesses(id string) ([]runtime.ContainerProcessState, err
 	return processes, nil
 }
 
+// copyStdio relays IO from the stdio set (made up of Hyper-V sockets) and the
+// stdio pipes used by the child processes (made up of anonymous pipes or
+// PTYs). It returns a function that waits for all IO to stop and then releases
+// all the associated file descriptors.
+func copyStdio(stdioSet *core.StdioSet, stdioPipes *runtime.StdioPipes) func() {
+	wg := &sync.WaitGroup{}
+	if stdioPipes.Pty != nil {
+		if stdioSet.In != nil {
+			wg.Add(1)
+			go func() {
+				io.Copy(stdioPipes.Pty, stdioSet.In)
+				wg.Done()
+			}()
+		}
+		if stdioSet.Out != nil {
+			wg.Add(1)
+			go func() {
+				io.Copy(stdioSet.Out, stdioPipes.Pty)
+				stdioSet.Out.Close()
+				wg.Done()
+			}()
+		}
+	} else {
+		if stdioSet.In != nil {
+			wg.Add(1)
+			go func() {
+				io.Copy(stdioPipes.In, stdioSet.In)
+				stdioPipes.In.Close()
+				stdioPipes.In = nil
+				wg.Done()
+			}()
+		}
+		if stdioSet.Out != nil {
+			wg.Add(1)
+			go func() {
+				io.Copy(stdioSet.Out, stdioPipes.Out)
+				stdioSet.Out.Close()
+				wg.Done()
+			}()
+		}
+		if stdioSet.Err != nil {
+			wg.Add(1)
+			go func() {
+				io.Copy(stdioSet.Err, stdioPipes.Err)
+				stdioSet.Err.Close()
+				wg.Done()
+			}()
+		}
+	}
+	return func() {
+		// Close stdin so that the copying goroutine is safely unblocked; this is necessary
+		// because the host expects stdin to be closed before it will report process
+		// exit back to the client, and the client expects the process notification before
+		// it will close its side of stdin (which io.Copy is waiting on in the copying goroutine).
+		if stdioSet.In != nil {
+			stdioSet.In.CloseRead()
+		}
+		wg.Wait()
+		if stdioSet.In != nil {
+			stdioSet.In.Close()
+		}
+		stdioPipes.Close()
+	}
+}
+
 // RunExternalProcess runs a process in the utility VM outside of a container's
 // namespace.
 // This can be used for things like debugging or diagnosing the utility VM's
 // state.
 func (c *gcsCore) RunExternalProcess(params prot.ProcessParameters, stdioSet *core.StdioSet) (pid int, err error) {
-	stdioOptions := runtime.StdioOptions{
-		CreateIn:  params.CreateStdInPipe,
-		CreateOut: params.CreateStdOutPipe,
-		CreateErr: params.CreateStdErrPipe,
-	}
-	var master io.ReadWriteCloser
-	var console oslayer.File
-	emulateConsole := params.EmulateConsole
-	if emulateConsole {
-		// Allocate a console for the process.
-		// TODO: Should I duplicate the NewConsole functionality outside of
-		// runc to make for better separation between gcscore and runtime?
-		var consolePath string
-		master, consolePath, err = runc.NewConsole()
-		if err != nil {
-			return -1, errors.Wrap(err, "failed to create console for external process")
-		}
-		console, err = c.OS.OpenFile(consolePath, os.O_RDWR, 0777)
-		if err != nil {
-			return -1, errors.Wrap(err, "failed to open console file for external process")
-		}
-	}
+	var pipes *runtime.StdioPipes
+	defer pipes.Close()
 
 	ociProcess, err := processParametersToOCI(params)
 	if err != nil {
@@ -429,54 +466,55 @@ func (c *gcsCore) RunExternalProcess(params prot.ProcessParameters, stdioSet *co
 	cmd.SetDir(ociProcess.Cwd)
 	cmd.SetEnv(ociProcess.Env)
 
-	var wg sync.WaitGroup
+	var console oslayer.File
+	emulateConsole := params.EmulateConsole
 	if emulateConsole {
-		// Begin copying data to and from the console.
-		// In order to ensure master is closed only after it's done being read
-		// from and written to, a sync.WaitGroup is used.
-		if stdioOptions.CreateIn {
-			wg.Add(1)
-			go func() {
-				io.Copy(master, stdioSet.In)
-				wg.Done()
-			}()
+		// Allocate a console for the process.
+		// TODO: Should I duplicate the NewConsole functionality outside of
+		// runc to make for better separation between gcscore and runtime?
+		var consolePath string
+		pipes.Pty, consolePath, err = runc.NewConsole()
+		if err != nil {
+			return -1, errors.Wrap(err, "failed to create console for external process")
 		}
-		if stdioOptions.CreateOut {
-			wg.Add(1)
-			go func() {
-				io.Copy(stdioSet.Out, master)
-				wg.Done()
-			}()
+		console, err = c.OS.OpenFile(consolePath, os.O_RDWR, 0777)
+		if err != nil {
+			return -1, errors.Wrap(err, "failed to open console file for external process")
 		}
 
 		cmd.SetStdin(console)
 		cmd.SetStdout(console)
 		cmd.SetStderr(console)
 	} else {
-		if stdioOptions.CreateIn {
-			// Stdin uses cmd.StdinPipe() instead of cmd.Stdin because cmd.Wait()
-			// waits for cmd.Stdin to return EOF. We can only guarantee an EOF by
-			// closing the pipe after the process exits.
-			cmdStdin, err := cmd.StdinPipe()
+		if stdioSet.In != nil {
+			pipes.In, err = cmd.StdinPipe()
 			if err != nil {
 				return -1, errors.Wrap(err, "failed to get stdin pipe for command")
 			}
-			wg.Add(1)
-			go func() {
-				io.Copy(cmdStdin, stdioSet.In)
-				cmdStdin.Close() // Notify the process that there is no more input.
-				wg.Done()
-			}()
 		}
-		if stdioOptions.CreateOut {
-			cmd.SetStdout(stdioSet.Out)
+		if stdioSet.Out != nil {
+			pipes.Out, err = cmd.StdoutPipe()
+			if err != nil {
+				return -1, errors.Wrap(err, "failed to get stdin pipe for command")
+			}
 		}
-		if stdioOptions.CreateErr {
-			cmd.SetStderr(stdioSet.Err)
+		if stdioSet.Err != nil {
+			pipes.Err, err = cmd.StderrPipe()
+			if err != nil {
+				return -1, errors.Wrap(err, "failed to get stdin pipe for command")
+			}
 		}
 	}
 	if err := cmd.Start(); err != nil {
 		return -1, errors.Wrap(err, "failed call to Start for external process")
+	}
+
+	waitStdio := copyStdio(stdioSet, pipes)
+	pipes = nil
+
+	// Close the console slave handle (which is now duped to the child process).
+	if console != nil {
+		console.Close()
 	}
 
 	processEntry := newProcessCacheEntry()
@@ -491,36 +529,8 @@ func (c *gcsCore) RunExternalProcess(params prot.ProcessParameters, stdioSet *co
 		}
 		utils.LogMsgf("external process %d exited with exit status %d", cmd.Process().Pid(), cmd.ExitState().ExitCode())
 
-		// Close stdin so that the copying goroutine is safely unblocked; this is necessary
-		// because the host expects stdin to be closed before it will report process
-		// exit back to the client, and the client expects the process notification before
-		// it will close its side of stdin (which io.Copy is waiting on in the copying goroutine).
-		if stdioSet.In != nil {
-			if err := stdioSet.In.CloseRead(); err != nil {
-				logrus.Errorf("failed call to CloseRead for external process stdin: %v: %s", ociProcess.Args, err)
-			}
-		}
-
-		// Close the console slave file to unblock IO to the console master file.
-		if console != nil {
-			console.Close()
-		}
-
-		// Wait for all users of stdioSet and master to finish before closing them.
-		wg.Wait()
-
-		if master != nil {
-			master.Close()
-		}
-		if stdioSet.In != nil {
-			stdioSet.In.Close()
-		}
-		if stdioSet.Out != nil {
-			stdioSet.Out.Close()
-		}
-		if stdioSet.Err != nil {
-			stdioSet.Err.Close()
-		}
+		// Wait for all IO to drain.
+		waitStdio()
 
 		// Run exit hooks for the process.
 		state := cmd.ExitState()
@@ -635,38 +645,6 @@ func (c *gcsCore) RegisterProcessExitHook(pid int, exitHook func(oslayer.Process
 	} else {
 		entry.AddExitHook(exitHook)
 	}
-	return nil
-}
-
-// setupStdioPipes begins copying data between each stdioSet reader/writer and
-// the container's stdio pipes.
-func (c *gcsCore) setupStdioPipes(p runtime.Process, stdioSet *core.StdioSet) error {
-	pipes, err := p.GetStdioPipes()
-	if err != nil {
-		return err
-	}
-	if pipes.In != nil {
-		go func() {
-			io.Copy(pipes.In, stdioSet.In)
-			pipes.In.Close()
-			stdioSet.In.Close()
-		}()
-	}
-	if pipes.Out != nil {
-		go func() {
-			io.Copy(stdioSet.Out, pipes.Out)
-			pipes.Out.Close()
-			stdioSet.Out.Close()
-		}()
-	}
-	if pipes.Err != nil {
-		go func() {
-			io.Copy(stdioSet.Err, pipes.Err)
-			pipes.Err.Close()
-			stdioSet.Err.Close()
-		}()
-	}
-
 	return nil
 }
 
