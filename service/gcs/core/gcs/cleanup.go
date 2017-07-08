@@ -51,7 +51,7 @@ func (c *gcsCore) cleanupContainer(containerEntry *containerCacheEntry) error {
 
 // forceDeleteContainer deletes the container, no matter its initial state.
 func (c *gcsCore) forceDeleteContainer(container runtime.Container) error {
-	exists, err := c.Rtime.ContainerExists(container.ID())
+	exists, err := container.Exists()
 	if err != nil {
 		return err
 	}

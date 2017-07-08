@@ -35,21 +35,21 @@ type runcRuntime struct {
 var _ runtime.Runtime = &runcRuntime{}
 
 type container struct {
-	id  string
-	r   *runcRuntime
-	pid int
+	r *runcRuntime
+	p *process
 }
 
 func (c *container) ID() string {
-	return c.id
+	return c.p.id
 }
 
 func (c *container) Pid() int {
-	return c.pid
+	return c.p.Pid()
 }
 
 type process struct {
-	c   *container
+	r   *runcRuntime
+	id  string
 	pid int
 }
 
@@ -96,10 +96,10 @@ func (r *runcRuntime) CreateContainer(id string, bundlePath string, stdioOptions
 // CreateContainer.
 func (c *container) Start() error {
 	logPath := c.r.getLogPath()
-	cmd := exec.Command(runcPath, "--log", logPath, "start", c.id)
+	cmd := exec.Command(runcPath, "--log", logPath, "start", c.p.id)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		c.r.cleanupContainer(c.id)
+		c.r.cleanupContainer(c.p.id)
 		return errors.Wrapf(err, "runc start failed with: %s", out)
 	}
 	return nil
@@ -118,7 +118,7 @@ func (c *container) ExecProcess(process oci.Process, stdioOptions runtime.StdioO
 // Kill sends the specified signal to the container's init process.
 func (c *container) Kill(signal oslayer.Signal) error {
 	logPath := c.r.getLogPath()
-	cmd := exec.Command(runcPath, "--log", logPath, "kill", c.id, strconv.Itoa(int(signal)))
+	cmd := exec.Command(runcPath, "--log", logPath, "kill", c.p.id, strconv.Itoa(int(signal)))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.Wrapf(err, "runc kill failed with: %s", out)
@@ -130,12 +130,12 @@ func (c *container) Kill(signal oslayer.Signal) error {
 // wrapper or runC itself.
 func (c *container) Delete() error {
 	logPath := c.r.getLogPath()
-	cmd := exec.Command(runcPath, "--log", logPath, "delete", c.id)
+	cmd := exec.Command(runcPath, "--log", logPath, "delete", c.p.id)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.Wrapf(err, "runc delete failed with: %s", out)
 	}
-	if err := c.r.cleanupContainer(c.id); err != nil {
+	if err := c.r.cleanupContainer(c.p.id); err != nil {
 		return err
 	}
 	return nil
@@ -144,7 +144,7 @@ func (c *container) Delete() error {
 // Delete deletes any state created for the process by either this
 // wrapper or runC itself.
 func (p *process) Delete() error {
-	if err := p.c.r.cleanupProcess(p.c.id, p.pid); err != nil {
+	if err := p.r.cleanupProcess(p.id, p.pid); err != nil {
 		return err
 	}
 	return nil
@@ -153,7 +153,7 @@ func (p *process) Delete() error {
 // Pause suspends all processes running in the container.
 func (c *container) Pause() error {
 	logPath := c.r.getLogPath()
-	cmd := exec.Command(runcPath, "--log", logPath, "pause", c.id)
+	cmd := exec.Command(runcPath, "--log", logPath, "pause", c.p.id)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.Wrapf(err, "runc pause failed with: %s", out)
@@ -164,7 +164,7 @@ func (c *container) Pause() error {
 // Resume unsuspends processes running in the container.
 func (c *container) Resume() error {
 	logPath := c.r.getLogPath()
-	cmd := exec.Command(runcPath, "--log", logPath, "resume", c.id)
+	cmd := exec.Command(runcPath, "--log", logPath, "resume", c.p.id)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.Wrapf(err, "runc resume failed with: %s", out)
@@ -175,14 +175,14 @@ func (c *container) Resume() error {
 // GetState returns information about the given container.
 func (c *container) GetState() (*runtime.ContainerState, error) {
 	logPath := c.r.getLogPath()
-	cmd := exec.Command(runcPath, "--log", logPath, "state", c.id)
+	cmd := exec.Command(runcPath, "--log", logPath, "state", c.p.id)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, errors.Wrapf(err, "runc state failed with: %s", out)
 	}
 	var state runtime.ContainerState
 	if err := json.Unmarshal(out, &state); err != nil {
-		return nil, errors.Wrapf(err, "failed to unmarshal the state for container %s", c.id)
+		return nil, errors.Wrapf(err, "failed to unmarshal the state for container %s", c.p.id)
 	}
 	return &state, nil
 }
@@ -199,7 +199,7 @@ func (c *container) Exists() (bool, error) {
 	// TODO: This is definitely not the most efficient way of doing this. See
 	// about improving it in the future.
 	for _, state := range states {
-		if state.ID == c.id {
+		if state.ID == c.p.id {
 			return true, nil
 		}
 	}
@@ -225,7 +225,7 @@ func (r *runcRuntime) ListContainerStates() ([]runtime.ContainerState, error) {
 // GetRunningProcesses gets only the running processes associated with
 // the given container. This excludes zombie processes.
 func (c *container) GetRunningProcesses() ([]runtime.ContainerProcessState, error) {
-	pids, err := c.r.getRunningPids(c.id)
+	pids, err := c.r.getRunningPids(c.p.id)
 	if err != nil {
 		return nil, err
 	}
@@ -243,9 +243,9 @@ func (c *container) GetRunningProcesses() ([]runtime.ContainerProcessState, erro
 
 	// For each process state directory which corresponds to a running pid, set
 	// that the process was created by the Runtime.
-	processDirs, err := ioutil.ReadDir(filepath.Join(containerFilesDir, c.id))
+	processDirs, err := ioutil.ReadDir(filepath.Join(containerFilesDir, c.p.id))
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to read the contents of container directory %s", filepath.Join(containerFilesDir, c.id))
+		return nil, errors.Wrapf(err, "failed to read the contents of container directory %s", filepath.Join(containerFilesDir, c.p.id))
 	}
 	for _, processDir := range processDirs {
 		if processDir.Name() != initPidFilename {
@@ -265,7 +265,7 @@ func (c *container) GetRunningProcesses() ([]runtime.ContainerProcessState, erro
 // GetAllProcesses gets all processes associated with the given
 // container, including both running and zombie processes.
 func (c *container) GetAllProcesses() ([]runtime.ContainerProcessState, error) {
-	runningPids, err := c.r.getRunningPids(c.id)
+	runningPids, err := c.r.getRunningPids(c.p.id)
 	if err != nil {
 		return nil, err
 	}
@@ -281,9 +281,9 @@ func (c *container) GetAllProcesses() ([]runtime.ContainerProcessState, error) {
 		pidMap[pid] = &runtime.ContainerProcessState{Pid: pid, Command: command, CreatedByRuntime: false, IsZombie: false}
 	}
 
-	processDirs, err := ioutil.ReadDir(filepath.Join(containerFilesDir, c.id))
+	processDirs, err := ioutil.ReadDir(filepath.Join(containerFilesDir, c.p.id))
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to read the contents of container directory %s", filepath.Join(containerFilesDir, c.id))
+		return nil, errors.Wrapf(err, "failed to read the contents of container directory %s", filepath.Join(containerFilesDir, c.p.id))
 	}
 	// Loop over every process state directory. Since these processes have
 	// process state directories, CreatedByRuntime will be true for all of
@@ -375,7 +375,7 @@ func (r *runcRuntime) waitOnProcess(pid int) (oslayer.ProcessExitState, error) {
 }
 
 func (p *process) Wait() (oslayer.ProcessExitState, error) {
-	return p.c.r.waitOnProcess(p.pid)
+	return p.r.waitOnProcess(p.pid)
 }
 
 // Wait waits on every non-init process in the container, and then
@@ -389,12 +389,12 @@ func (c *container) Wait() (oslayer.ProcessExitState, error) {
 	}
 	for _, process := range processes {
 		// Only wait on non-init processes that were created with exec.
-		if process.Pid != c.pid && process.CreatedByRuntime {
+		if process.Pid != c.p.pid && process.CreatedByRuntime {
 			// TODO: Should we check for errors here?
 			c.r.waitOnProcess(process.Pid)
 		}
 	}
-	state, err := c.r.waitOnProcess(c.pid)
+	state, err := c.p.Wait()
 	if err != nil {
 		return nil, err
 	}
@@ -417,18 +417,18 @@ func (r *runcRuntime) runCreateCommand(id string, bundlePath string, stdioOption
 		return nil, err
 	}
 	args := []string{"create", "-b", bundlePath, "--no-pivot"}
-	pid, err := r.startProcess(id, tempProcessDir, hasTerminal, stdioOptions, args...)
+	p, err := r.startProcess(id, tempProcessDir, hasTerminal, stdioOptions, args...)
 	if err != nil {
 		return nil, err
 	}
 
 	// Write pid to initpid file for container.
 	containerDir := r.getContainerDir(id)
-	if err := ioutil.WriteFile(filepath.Join(containerDir, initPidFilename), []byte(strconv.Itoa(pid)), 0777); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(containerDir, initPidFilename), []byte(strconv.Itoa(p.pid)), 0777); err != nil {
 		return nil, err
 	}
 
-	c = &container{pid: pid}
+	c = &container{r: r, p: p}
 	return c, nil
 }
 
@@ -449,7 +449,7 @@ func (r *runcRuntime) hasTerminal(bundlePath string) (bool, error) {
 // runExecCommand sets up the arguments for calling runc exec.
 func (c *container) runExecCommand(processDef oci.Process, stdioOptions runtime.StdioOptions) (p runtime.Process, err error) {
 	// Create a temporary random directory to store the process's files.
-	tempProcessDir, err := ioutil.TempDir(containerFilesDir, c.id)
+	tempProcessDir, err := ioutil.TempDir(containerFilesDir, c.p.id)
 	if err != nil {
 		return nil, err
 	}
@@ -464,21 +464,17 @@ func (c *container) runExecCommand(processDef oci.Process, stdioOptions runtime.
 
 	args := []string{"exec"}
 	args = append(args, "-d", "--process", filepath.Join(tempProcessDir, "process.json"))
-	pid, err := c.r.startProcess(c.id, tempProcessDir, processDef.Terminal, stdioOptions, args...)
-	if err != nil {
-		return nil, err
-	}
-	return &process{c: c, pid: pid}, nil
+	return c.r.startProcess(c.p.id, tempProcessDir, processDef.Terminal, stdioOptions, args...)
 }
 
 // startProcess performs the operations necessary to start a container process
 // and properly handle its stdio.
 // This function is used by both CreateContainer and ExecProcess.
-func (r *runcRuntime) startProcess(id string, tempProcessDir string, hasTerminal bool, stdioOptions runtime.StdioOptions, initialArgs ...string) (pid int, err error) {
+func (r *runcRuntime) startProcess(id string, tempProcessDir string, hasTerminal bool, stdioOptions runtime.StdioOptions, initialArgs ...string) (p *process, err error) {
 	args := initialArgs
 
 	if err := containerdsys.SetSubreaper(1); err != nil {
-		return -1, errors.Wrapf(err, "failed to set process as subreaper for process in container %s", id)
+		return nil, errors.Wrapf(err, "failed to set process as subreaper for process in container %s", id)
 	}
 
 	logPath := r.getLogPath()
@@ -492,7 +488,7 @@ func (r *runcRuntime) startProcess(id string, tempProcessDir string, hasTerminal
 	if hasTerminal {
 		sockListener, consoleSockPath, err := r.createConsoleSocket(tempProcessDir)
 		if err != nil {
-			return -1, err
+			return nil, err
 		}
 		args = append(args, "--console-socket", consoleSockPath)
 		// setupIOForTerminal blocks, so it needs to run in a separate go
@@ -506,7 +502,7 @@ func (r *runcRuntime) startProcess(id string, tempProcessDir string, hasTerminal
 	} else {
 		ioSet, err := r.setupIOWithoutTerminal(id, tempProcessDir, stdioOptions)
 		if err != nil {
-			return -1, err
+			return nil, err
 		}
 		cmdStdin = ioSet.InR
 		cmdStdout = ioSet.OutW
@@ -519,19 +515,19 @@ func (r *runcRuntime) startProcess(id string, tempProcessDir string, hasTerminal
 	cmd.Stdout = cmdStdout
 	cmd.Stderr = cmdStderr
 	if err := cmd.Start(); err != nil {
-		return -1, errors.Wrapf(err, "failed to start runc create/exec call for container %s", id)
+		return nil, errors.Wrapf(err, "failed to start runc create/exec call for container %s", id)
 	}
 	if err := cmd.Wait(); err != nil {
-		return -1, errors.Wrapf(err, "failed to wait on runc create/exec call for container %s", id)
+		return nil, errors.Wrapf(err, "failed to wait on runc create/exec call for container %s", id)
 	}
 
 	// Rename the process's directory to its pid.
-	pid, err = r.readPidFile(filepath.Join(tempProcessDir, "pid"))
+	pid, err := r.readPidFile(filepath.Join(tempProcessDir, "pid"))
 	if err != nil {
-		return -1, err
+		return nil, err
 	}
 	if err := os.Rename(tempProcessDir, filepath.Join(r.getContainerDir(id), strconv.Itoa(pid))); err != nil {
-		return -1, err
+		return nil, err
 	}
-	return pid, nil
+	return &process{r: r, id: id, pid: pid}, nil
 }

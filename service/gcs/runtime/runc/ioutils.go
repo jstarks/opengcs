@@ -32,20 +32,15 @@ type ioSet struct {
 
 // GetStdioPipes returns the stdio pipes used by the given process.
 func (c *container) GetStdioPipes() (*runtime.StdioPipes, error) {
-	return c.r.getStdioPipes(c.id, c.pid)
+	return c.p.GetStdioPipes()
 }
 
 // GetStdioPipes returns the stdio pipes used by the given process.
 func (p *process) GetStdioPipes() (*runtime.StdioPipes, error) {
-	return p.c.r.getStdioPipes(p.c.id, p.pid)
-}
-
-// getStdioPipes returns the stdio pipes used by the given process.
-func (r *runcRuntime) getStdioPipes(id string, pid int) (*runtime.StdioPipes, error) {
-	processDir := r.getProcessDir(id, pid)
+	processDir := p.r.getProcessDir(p.id, p.pid)
 	stdinPath := filepath.Join(processDir, "in")
 	var stdin io.WriteCloser
-	stdinPathExists, err := r.pathExists(stdinPath)
+	stdinPathExists, err := p.r.pathExists(stdinPath)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +53,7 @@ func (r *runcRuntime) getStdioPipes(id string, pid int) (*runtime.StdioPipes, er
 
 	stdoutPath := filepath.Join(processDir, "out")
 	var stdout io.ReadCloser
-	stdoutPathExists, err := r.pathExists(stdoutPath)
+	stdoutPathExists, err := p.r.pathExists(stdoutPath)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +66,7 @@ func (r *runcRuntime) getStdioPipes(id string, pid int) (*runtime.StdioPipes, er
 
 	stderrPath := filepath.Join(processDir, "err")
 	var stderr io.ReadCloser
-	stderrPathExists, err := r.pathExists(stderrPath)
+	stderrPathExists, err := p.r.pathExists(stderrPath)
 	if err != nil {
 		return nil, err
 	}

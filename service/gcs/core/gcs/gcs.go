@@ -59,7 +59,7 @@ type gcsCore struct {
 }
 
 // NewGCSCore creates a new gcsCore struct initialized with the given Runtime.
-func NewGCSCore(rtime runtime.Runtime, os oslayer.OS) core.Core {
+func NewGCSCore(rtime runtime.Runtime, os oslayer.OS) *gcsCore {
 	return &gcsCore{
 		Rtime:                rtime,
 		OS:                   os,

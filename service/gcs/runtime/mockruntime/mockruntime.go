@@ -73,7 +73,7 @@ func (c *container) GetState() (*runtime.ContainerState, error) {
 	return state, nil
 }
 
-func (r *mockRuntime) ContainerExists(id string) (bool, error) {
+func (c *container) Exists() (bool, error) {
 	return true, nil
 }
 
